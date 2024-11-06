@@ -37,8 +37,21 @@ func main() {
 		// You can use print statements as follows for debugging, they'll be visible when running tests.
 		fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
 
-		// Uncomment this to pass the first stage
-		fmt.Printf("database page size: %v", pageSize)
+		fmt.Printf("database page size: %v\n", pageSize)
+
+		bTreePageHeader := make([]byte, 12)
+		_, err = databaseFile.Read(bTreePageHeader)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		var numberOfCells uint16
+		if err := binary.Read(bytes.NewReader(header[3:5]), binary.BigEndian, &numberOfCells); err != nil {
+			fmt.Println("Failed to read integer:", err)
+			return
+		}
+		fmt.Printf("number of tables: %v\n", numberOfCells)
+
 	default:
 		fmt.Println("Unknown command", command)
 		os.Exit(1)
