@@ -46,7 +46,7 @@ func main() {
 		}
 
 		var numberOfCells uint16
-		if err := binary.Read(bytes.NewReader(header[3:5]), binary.BigEndian, &numberOfCells); err != nil {
+		if err := binary.Read(bytes.NewReader(bTreePageHeader[3:5]), binary.BigEndian, &numberOfCells); err != nil {
 			fmt.Println("Failed to read integer:", err)
 			return
 		}
