@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -14,16 +13,17 @@ import (
 
 // Usage: your_program.sh sample.db .dbinfo
 func main() {
-	databaseFilePath := os.Args[1]
+	dbFilePath := os.Args[1]
 	command := os.Args[2]
-	databaseFile, err := os.Open(databaseFilePath)
-	if err != nil {
-		log.Fatal(err)
-	}
 
 	switch command {
 	case ".dbinfo":
-		dbHeader, err := NewDBSchemaHeader(*databaseFile)
+		dbFile, err := os.Open(dbFilePath)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		dbHeader, err := NewDBSchemaHeader(dbFile)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -32,10 +32,12 @@ func main() {
 
 		fmt.Printf("database page size: %v\n", pageSize)
 
-		dbReader := bufio.NewReader(databaseFile)
-		dbReader.Discard(HeaderRange[1])
-		bTreePageHeader := make([]byte, 12)
-		_, err = dbReader.Read(bTreePageHeader)
+		_, err = dbFile.Seek(int64(HeaderRange[1]), io.SeekStart)
+		if err != nil {
+			log.Fatal(err)
+		}
+		bTreePageHeader := make([]byte, BTreePageRange[1])
+		_, err = dbFile.Read(bTreePageHeader)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -49,15 +51,29 @@ func main() {
 
 		fmt.Printf("number of tables: %v\n", numberOfCells)
 	case ".tables":
-		dbReader := bufio.NewReader(databaseFile)
-		bTreePageHeader := make([]byte, 12)
-
-		_, err := dbReader.Discard(HeaderRange[1])
+		dbFile, err := os.Open(dbFilePath)
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		_, err = dbReader.Read(bTreePageHeader)
+		_, err = dbFile.Seek(int64(HeaderRange[1]), io.SeekStart)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		bTreePageFlag := make([]byte, 1)
+		_, err = dbFile.ReadAt(bTreePageFlag, int64(HeaderRange[1]))
+		if err != nil {
+			log.Fatal(err)
+		}
+		_, bTreePgHeaderSize := BTreePageTypeAndSize(bTreePageFlag[0])
+
+		if bTreePgHeaderSize == 0 {
+			log.Fatal("invalid b tree page type")
+		}
+
+		bTreePageHeader := make([]byte, bTreePgHeaderSize)
+		_, err = dbFile.Read(bTreePageHeader) // reading the header positions pointer right at cell pointer array
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -68,107 +84,125 @@ func main() {
 			fmt.Println("Failed to read number of cells integer:", err)
 			return
 		}
+		// fmt.Printf("number of tables: %v\n", numberOfCells)
 
-		cellOffsets := make([]int, numberOfCells)
+		tableNames := ""
+		cellStartOffset := int64(HeaderRange[1] + bTreePgHeaderSize)
 
 		for n := range numberOfCells {
-			var offset uint16
-			offsetBytes := make([]byte, 2)
-			_, err := dbReader.Read(offsetBytes)
+			// fmt.Println("ITERATING CELL: ", n)
+
+			// set pointer to cell pointer position
+			dbFile.Seek(cellStartOffset+int64(n*OffsetByteLen), io.SeekStart)
+
+			cellOffset := int16(0)
+			offsetBytes := make([]byte, OffsetByteLen)
+			_, err := dbFile.Read(offsetBytes /* accumOffset */)
+
 			if err != nil {
 				log.Fatal(err)
 			}
 
-			err = ReadBinaryFromBytes(offsetBytes, &offset)
+			err = ReadBinaryFromBytes(offsetBytes, &cellOffset)
 			if err != nil {
-				fmt.Println("Failed to read offset for cell", n, ": ", err)
+				fmt.Println("Failed to read offset for cell", ": ", err)
 				log.Fatal(err)
 			}
+			// fmt.Println("offset: ", cellOffset)
 
-			cellOffsets = append(cellOffsets, int(offset))
-		}
+			//** ---  read cells
+			_, err = dbFile.Seek(int64(cellOffset), io.SeekStart) // set offset for cell read
+			if err != nil {
+				fmt.Println("unable to set offset for cell", err)
+				continue
+			}
 
-		fmt.Println("offsets", cellOffsets)
+			// 1 record size
+			buf := make([]byte, 9)
+			_, err = dbFile.ReadAt(buf, io.SeekCurrent)
+			if err != nil {
+				fmt.Println("unable to read record size for cell ", err)
+				continue
+			}
+			recordSize, recordSizeLen := binary.Uvarint(buf)
+			if recordSizeLen <= 0 {
+				fmt.Println("buf is too small or value is larger than 64-bits for cell ", n)
+				continue
+			}
+			// fmt.Println("Record size and len: ", recordSize, recordSizeLen)
 
-		// either create a new reader or reset existing
-		dbReader.Reset(bufio.NewReader(databaseFile))
+			// 2 rowid
+			_, err = dbFile.Seek(int64(recordSizeLen), io.SeekCurrent)
 
-		// bytesRead :=
-		for i, offset := range cellOffsets {
-			fmt.Println("cell", i, offset)
+			if err != nil {
+				fmt.Println("unable to set offset for cell rowid", n)
+				continue
+			}
 
-			// TODO: this could be achieved by using the io.ReaderAt interface
-			if i == 0 { // discard first offset
-				dbReader.Discard(offset)
-				// 1 record size
-				recordSizeBytes, err := dbReader.Peek(9)
+			buf = make([]byte, 9)
+			_, err = dbFile.ReadAt(buf, io.SeekCurrent)
+			if err != nil {
+				fmt.Println("unable to read bytes for row id for cell", n)
+				continue
+			}
+			_, rowIdLen := binary.Uvarint(buf)
+			if rowIdLen <= 0 {
+				fmt.Println("row id buf is too small or value is larger than 64-bits for cell ", n)
+				continue
+			}
+			// fmt.Println("Row id: ", rowId)
+
+			// 3 record
+			dbFile.Seek(int64(rowIdLen), io.SeekCurrent)
+
+			record := make([]byte, recordSize)
+			_, err = dbFile.Read(record)
+			if err != nil {
+				fmt.Println("failed to read record: ", err)
+				continue
+			}
+
+			headerSize, headerSizeLen := binary.Uvarint(record)
+			if headerSizeLen <= 0 {
+				fmt.Println("header buf is too small or value is larger than 64-bits for cell")
+				continue
+			}
+			// fmt.Println("header size:", headerSize)
+
+			recordHeader := bytes.NewReader(record[headerSizeLen:headerSize])
+			recordBody := record[headerSize:]
+			recordContentSizes := []uint64{}
+
+			for {
+				serialType, err := binary.ReadUvarint(recordHeader)
+
 				if err != nil {
-					fmt.Println("unable to read record size for cell")
-					continue
-				}
-				recordSize, recordSizeLen := binary.Varint(recordSizeBytes)
-				if recordSizeLen <= 0 {
-					fmt.Println("buf is too small or value is larger than 64-bits for cell ", i)
-					continue
-				}
-				fmt.Println("Record size: ", recordSize)
-				dbReader.Discard(recordSizeLen)
-
-				// 2 rowid
-				rowIdBytes, err := dbReader.Peek(9)
-				if err != nil {
-					fmt.Println("unable to read record size for cell", i)
-					continue
-				}
-				rowId, rowIdLen := binary.Varint(rowIdBytes)
-				if rowIdLen <= 0 {
-					fmt.Println("row id buf is too small or value is larger than 64-bits for cell ", i)
-					continue
-				}
-				fmt.Println("Row id: ", rowId)
-				dbReader.Discard(rowIdLen)
-
-				// 3 record
-				record := make([]byte, recordSize)
-				_, err = dbReader.Read(record)
-				if err != nil {
-					fmt.Println("failed to read record: ", err)
-					continue
-				}
-
-				// headerReader := bytes.NewReader(record)
-				// headerSize, err := binary.ReadVarint(headerReader)
-
-				headerSize, headerSizeLen := binary.Varint(record)
-				if headerSizeLen <= 0 {
-					fmt.Println("header buf is too small or value is larger than 64-bits for cell")
-					continue
-				}
-				fmt.Println("header size:", headerSize)
-				header := bytes.NewBuffer(record[headerSizeLen:headerSize])
-
-				for {
-					serialType, err := binary.ReadVarint(header)
-
-					if err != nil {
-						if err == io.EOF {
-							fmt.Println("Finished reading record header")
-						} else {
-							fmt.Println("failed to read serial type")
-						}
-						break
+					if err == io.EOF {
+						// fmt.Println("Finished reading record header")
+					} else {
+						fmt.Println("failed to read serial type")
 					}
-
-					fmt.Println("serial type: ", serialType)
-
+					break
 				}
 
-			} else {
-				dbReader.Read(offset - cellOffsets[i-1])
+				contentSize, ok := SerialTypeData(serialType)
+
+				if !ok {
+					fmt.Println("invalid serial type ", serialType)
+					recordContentSizes = append(recordContentSizes, 0)
+				} else {
+					recordContentSizes = append(recordContentSizes, contentSize)
+				}
+
+				// fmt.Println("serial type, contentSize ", serialType, contentSize)
 			}
+
+			offsetToTblName := recordContentSizes[0] + recordContentSizes[1]
+			tableNames += string(recordBody[offsetToTblName:offsetToTblName+recordContentSizes[2]]) + " "
 
 		}
 
+		fmt.Println(tableNames)
 	default:
 		fmt.Println("Unknown command", command)
 		os.Exit(1)

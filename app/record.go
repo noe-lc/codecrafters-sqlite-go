@@ -28,4 +28,6 @@ func SerialTypeData(serialInt uint64) (uint64, bool) {
 			return (serialInt - 13) / 2, true
 		}
 	}
+
+	return 0, false
 }
