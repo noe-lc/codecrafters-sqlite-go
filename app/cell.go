@@ -160,8 +160,6 @@ func (r *Record) Fields() ([][]byte, []FieldParser, error) {
 	// fmt.Println("header to read", r[headerByteLen:len(header)])
 	// fmt.Printf("body - size: %v bytes: %v", bodyLen, body)
 
-	fmt.Println("body length", bodyLen)
-
 	for {
 		serialType, err := binary.ReadUvarint(headerReader)
 		if err != nil {
